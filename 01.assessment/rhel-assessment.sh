@@ -1,13 +1,17 @@
 #!/bin/bash
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 
 ################################################################################
 # RHEL Server Assessment Script
-# Version: 1.0.2
+# Version: 1.0.3
 # Purpose: Assess RHEL/Rocky Linux servers and generate remediation plans
 #
 # Change Log:
+# - 1.0.3: Further enhanced non-systemd process detection
+#   * Captures PID, owner, full command line, and working directory (CWD)
+#   * Improved systemd management detection using cgroups
+#   * Reports all matching PIDs for monitored process names
 # - 1.0.2: Enhanced application detection
 #   * Oracle detection now includes running processes (ora_pmon_*)
 #   * Non-systemd processes now show executable paths
@@ -31,8 +35,8 @@ LOGS_DIR="$WORKSPACE_DIR/logs"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
 LOG_FILE="$LOGS_DIR/01-assessment-$TIMESTAMP.log"
 JSON_FILE="$LOGS_DIR/01-assessment-$TIMESTAMP.json"
-MD_FILE="$WORKSPACE_DIR/01-assessment-$TIMESTAMP.md"
 PREVIOUS_JSON="$LOGS_DIR/latest-assessment.json"
+MD_FILE="$WORKSPACE_DIR/01-assessment.md"
 
 # Track if we're using sudo
 USE_SUDO=""
@@ -827,7 +831,7 @@ phase9_application_detection() {
 
     # Java/JDK Detection
     log_info "Detecting Java installations..."
-    
+
     # Build list of directories to search including all /u0* directories
     local java_dirs=("/usr/lib/jvm" "/usr/java" "/opt/java" "/opt" "/usr/local")
     for u_dir in /u0*; do
@@ -875,7 +879,7 @@ phase9_application_detection() {
 
     # Tomcat Detection
     log_info "Detecting Tomcat installations..."
-    
+
     # Build list of directories to search including all /u0* directories
     local tomcat_dirs=("/opt" "/usr/share" "/var/lib" "/usr/local")
     for u_dir in /u0*; do
@@ -918,7 +922,7 @@ phase9_application_detection() {
             # Try to extract catalina.home or catalina.base from process command line
             if [[ -r "/proc/$pid/cmdline" ]]; then
                 local cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
-                
+
                 # Look for -Dcatalina.home or -Dcatalina.base
                 local catalina_home=$(echo "$cmdline" | grep -oP '(?<=-Dcatalina\.home=)[^ ]+' | head -1)
                 if [[ -z "$catalina_home" ]]; then
@@ -1111,18 +1115,49 @@ phase10_process_analysis() {
     local check_processes=("java" "tomcat" "oracle" "httpd" "nginx")
     for proc_name in "${check_processes[@]}"; do
         if pgrep -f "$proc_name" &>/dev/null; then
-            # Check if there's a systemd unit for it
-            if ! systemctl list-units --all --no-pager | grep -q "$proc_name"; then
-                ((non_systemd_count++))
-                # Get the executable path for the first matching process
-                local pid=$(pgrep -f "$proc_name" | head -1)
-                local exe_path="unknown"
-                if [[ -n "$pid" ]] && [[ -L "/proc/$pid/exe" ]]; then
-                    exe_path=$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo "unknown")
+            # Get all PIDs matching the process name
+            local pids=$(pgrep -f "$proc_name")
+
+            for pid in $pids; do
+                # Check if this specific PID is managed by systemd
+                # We check the cgroup to see if it's within a system.slice
+                if ! grep -q "system.slice" "/proc/$pid/cgroup" 2>/dev/null; then
+                    ((non_systemd_count++))
+
+                    # Get the executable path
+                    local exe_path="unknown"
+                    if [[ -L "/proc/$pid/exe" ]]; then
+                        exe_path=$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo "unknown")
+                    fi
+
+                    # Get the process owner
+                    local user=$(ps -p "$pid" -o user= 2>/dev/null || echo "unknown")
+
+                    # Get the full command line (tr nulls to spaces)
+                    local cmdline="unknown"
+                    if [[ -f "/proc/$pid/cmdline" ]]; then
+                        cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | xargs || echo "unknown")
+                    fi
+
+                    # Get the current working directory
+                    local cwd="unknown"
+                    if [[ -L "/proc/$pid/cwd" ]]; then
+                        cwd=$(readlink -f "/proc/$pid/cwd" 2>/dev/null || echo "unknown")
+                    fi
+
+                    log_warn "Process '$proc_name' (PID: $pid, User: $user) running but not managed by systemd"
+                    log_debug "  Command: $cmdline"
+                    log_debug "  CWD: $cwd"
+                    log_debug "  Executable: $exe_path"
+
+                    # Escape quotes for JSON
+                    local safe_cmdline=$(echo "$cmdline" | sed 's/"/\\"/g')
+                    local safe_cwd=$(echo "$cwd" | sed 's/"/\\"/g')
+                    local safe_exe=$(echo "$exe_path" | sed 's/"/\\"/g')
+
+                    NON_SYSTEMD_PROCESSES+=("{\"pid\":$pid,\"name\":\"$proc_name\",\"user\":\"$user\",\"command\":\"$safe_cmdline\",\"cwd\":\"$safe_cwd\",\"executable\":\"$safe_exe\"}")
                 fi
-                log_warn "Process '$proc_name' running but not managed by systemd (executable: $exe_path)"
-                NON_SYSTEMD_PROCESSES+=("{\"name\":\"$proc_name\",\"executable\":\"$exe_path\"}")
-            fi
+            done
         fi
     done
 
@@ -1674,10 +1709,19 @@ EOF
             set +u
             local proc="${NON_SYSTEMD_PROCESSES[$i]}"
             set -u
-            # Parse JSON to extract name and executable
+            # Parse JSON to extract details
+            local pid=$(echo "$proc" | sed 's/.*"pid":\([0-9]*\).*/\1/')
             local proc_name=$(echo "$proc" | sed 's/.*"name":"\([^"]*\)".*/\1/')
+            local user=$(echo "$proc" | sed 's/.*"user":"\([^"]*\)".*/\1/')
+            local cmdline=$(echo "$proc" | sed 's/.*"command":"\([^"]*\)".*/\1/')
+            local cwd=$(echo "$proc" | sed 's/.*"cwd":"\([^"]*\)".*/\1/')
             local proc_exe=$(echo "$proc" | sed 's/.*"executable":"\([^"]*\)".*/\1/')
-            echo "- **$proc_name**: \`$proc_exe\`" >> "$MD_FILE"
+
+            echo "- **$proc_name** (PID: $pid, User: $user)" >> "$MD_FILE"
+            echo "  - **Command:** \`$cmdline\`" >> "$MD_FILE"
+            echo "  - **CWD:** \`$cwd\`" >> "$MD_FILE"
+            echo "  - **Executable:** \`$proc_exe\`" >> "$MD_FILE"
+            echo "" >> "$MD_FILE"
         done
         echo "" >> "$MD_FILE"
     else

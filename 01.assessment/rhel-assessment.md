@@ -499,13 +499,18 @@ The assessment is organized into logical phases. Each phase contains specific ch
 - **Systemd vs Non-Systemd Processes**
   - Cross-reference running processes with systemd units
   - Identify processes NOT managed by systemd (check: `java`, `tomcat`, `oracle`, `httpd`, `nginx`)
-  - **Capture executable path for each non-systemd process:**
-    - Get PID of process via `pgrep -f "<process_name>"`
+  - **Capture detailed information for each non-systemd process:**
+    - Get PID and process owner (user)
+    - Extract full command line from `/proc/$pid/cmdline`
+    - Extract current working directory (CWD) from `/proc/$pid/cwd`
     - Read `/proc/$pid/exe` via `readlink -f` to get full executable path
-    - Store both process name and executable location
   - Flag applications requiring manual startup
   - Store: `non_systemd_processes[]` with:
-    - `name` (process name)
+    - `pid` (process identifier)
+    - `name` (short process name)
+    - `user` (process owner)
+    - `command` (full command line with parameters)
+    - `cwd` (working directory)
     - `executable` (full path to executable)
 
 - **Process Resource Usage**
@@ -805,7 +810,16 @@ The JSON file should have this structure:
   "systemd": {
     "default_target": "multi-user.target",
     "failed_services": [],
-    "non_systemd_processes": []
+    "non_systemd_processes": [
+      {
+        "pid": 1234,
+        "name": "java",
+        "user": "oracle",
+        "command": "/usr/java/jdk1.8.0/bin/java -Dparam=value ...",
+        "cwd": "/u01/app/oracle",
+        "executable": "/usr/java/jdk1.8.0/bin/java"
+      }
+    ]
   },
   "applications": {
     "java": [
