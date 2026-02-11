@@ -1,13 +1,19 @@
 #!/bin/bash
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 
 ################################################################################
 # RHEL Server Assessment Script
-# Version: 1.0.1
+# Version: 1.0.2
 # Purpose: Assess RHEL/Rocky Linux servers and generate remediation plans
 #
 # Change Log:
+# - 1.0.2: Enhanced application detection
+#   * Oracle detection now includes running processes (ora_pmon_*)
+#   * Non-systemd processes now show executable paths
+#   * JDK detection: Dynamic /u0* scanning, running process detection, duplicate prevention
+#   * Tomcat detection: Dynamic /u0* scanning, catalina.home extraction from processes
+#   * Increased search depth (maxdepth 5) for nested installations
 # - 1.0.1: Added list of non-systemd managed processes to markdown report
 # - 1.0.0: Initial script development and testing
 ################################################################################
@@ -821,28 +827,71 @@ phase9_application_detection() {
 
     # Java/JDK Detection
     log_info "Detecting Java installations..."
-    local java_dirs=("/usr/lib/jvm" "/usr/java" "/opt/java" "/u00" "/u01" "/u02")
-
-    for base_dir in "${java_dirs[@]}"; do
-        if [[ -d "$base_dir" ]]; then
-            while IFS= read -r java_home; do
-                if [[ -f "$java_home/bin/java" ]]; then
-                    local version=$("$java_home/bin/java" -version 2>&1 | head -1 | cut -d'"' -f2)
-                    JDK_INSTALLATIONS+=("{\"path\":\"$java_home\",\"version\":\"$version\",\"in_use\":false}")
-                    log_info "Found JDK: $java_home (version: $version)"
-                fi
-            done < <(find "$base_dir" -maxdepth 3 -type d -name "jdk*" -o -name "java-*" 2>/dev/null)
+    
+    # Build list of directories to search including all /u0* directories
+    local java_dirs=("/usr/lib/jvm" "/usr/java" "/opt/java" "/opt" "/usr/local")
+    for u_dir in /u0*; do
+        if [[ -d "$u_dir" ]]; then
+            java_dirs+=("$u_dir")
         fi
     done
 
+    # Track found installations to avoid duplicates
+    declare -A found_jdks
+
+    # Search standard locations
+    for base_dir in "${java_dirs[@]}"; do
+        if [[ -d "$base_dir" ]]; then
+            while IFS= read -r java_home; do
+                if [[ -f "$java_home/bin/java" ]] && [[ -z "${found_jdks[$java_home]:-}" ]]; then
+                    local version=$("$java_home/bin/java" -version 2>&1 | head -1 | cut -d'"' -f2)
+                    JDK_INSTALLATIONS+=("{\"path\":\"$java_home\",\"version\":\"$version\",\"in_use\":false}")
+                    found_jdks[$java_home]=1
+                    log_info "Found JDK: $java_home (version: $version)"
+                fi
+            done < <(find "$base_dir" -maxdepth 5 -type d \( -name "jdk*" -o -name "java-*" -o -name "jre*" \) 2>/dev/null)
+        fi
+    done
+
+    # Detect JDK from running Java processes
+    if pgrep -f "java" &>/dev/null; then
+        log_info "Detecting Java installations from running processes..."
+        while IFS= read -r pid; do
+            if [[ -r "/proc/$pid/exe" ]]; then
+                local java_exe=$(readlink -f "/proc/$pid/exe" 2>/dev/null)
+                if [[ -n "$java_exe" ]] && [[ "$java_exe" =~ /bin/java$ ]]; then
+                    # Get JAVA_HOME (two directories up from bin/java)
+                    local java_home=$(dirname $(dirname "$java_exe"))
+                    if [[ -d "$java_home" ]] && [[ -z "${found_jdks[$java_home]:-}" ]]; then
+                        local version=$("$java_home/bin/java" -version 2>&1 | head -1 | cut -d'"' -f2 2>/dev/null || echo "unknown")
+                        JDK_INSTALLATIONS+=("{\"path\":\"$java_home\",\"version\":\"$version\",\"in_use\":true}")
+                        found_jdks[$java_home]=1
+                        log_info "Found running JDK: $java_home (version: $version)"
+                    fi
+                fi
+            fi
+        done < <(pgrep -f "java")
+    fi
+
     # Tomcat Detection
     log_info "Detecting Tomcat installations..."
-    local tomcat_dirs=("/opt" "/usr/share" "/u00" "/u01" "/u02" "/var/lib")
+    
+    # Build list of directories to search including all /u0* directories
+    local tomcat_dirs=("/opt" "/usr/share" "/var/lib" "/usr/local")
+    for u_dir in /u0*; do
+        if [[ -d "$u_dir" ]]; then
+            tomcat_dirs+=("$u_dir")
+        fi
+    done
 
+    # Track found installations to avoid duplicates
+    declare -A found_tomcats
+
+    # Search standard locations
     for base_dir in "${tomcat_dirs[@]}"; do
         if [[ -d "$base_dir" ]]; then
             while IFS= read -r tomcat_home; do
-                if [[ -f "$tomcat_home/bin/catalina.sh" ]]; then
+                if [[ -f "$tomcat_home/bin/catalina.sh" ]] && [[ -z "${found_tomcats[$tomcat_home]:-}" ]]; then
                     local version="unknown"
                     if [[ -f "$tomcat_home/bin/version.sh" ]]; then
                         version=$("$tomcat_home/bin/version.sh" 2>/dev/null | grep "Server number" | awk '{print $3}')
@@ -855,11 +904,40 @@ phase9_application_detection() {
                     fi
 
                     TOMCAT_INSTALLATIONS+=("{\"path\":\"$tomcat_home\",\"version\":\"$version\",\"running\":$running}")
+                    found_tomcats[$tomcat_home]=1
                     log_info "Found Tomcat: $tomcat_home (version: $version, running: $running)"
                 fi
-            done < <(find "$base_dir" -maxdepth 2 -type d -name "tomcat*" 2>/dev/null)
+            done < <(find "$base_dir" -maxdepth 5 -type d -name "tomcat*" 2>/dev/null)
         fi
     done
+
+    # Detect Tomcat from running processes
+    if pgrep -f "catalina" &>/dev/null || pgrep -f "org.apache.catalina" &>/dev/null; then
+        log_info "Detecting Tomcat installations from running processes..."
+        while IFS= read -r pid; do
+            # Try to extract catalina.home or catalina.base from process command line
+            if [[ -r "/proc/$pid/cmdline" ]]; then
+                local cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null)
+                
+                # Look for -Dcatalina.home or -Dcatalina.base
+                local catalina_home=$(echo "$cmdline" | grep -oP '(?<=-Dcatalina\.home=)[^ ]+' | head -1)
+                if [[ -z "$catalina_home" ]]; then
+                    catalina_home=$(echo "$cmdline" | grep -oP '(?<=-Dcatalina\.base=)[^ ]+' | head -1)
+                fi
+
+                if [[ -n "$catalina_home" ]] && [[ -d "$catalina_home" ]] && [[ -f "$catalina_home/bin/catalina.sh" ]] && [[ -z "${found_tomcats[$catalina_home]:-}" ]]; then
+                    local version="unknown"
+                    if [[ -f "$catalina_home/bin/version.sh" ]]; then
+                        version=$("$catalina_home/bin/version.sh" 2>/dev/null | grep "Server number" | awk '{print $3}')
+                    fi
+
+                    TOMCAT_INSTALLATIONS+=("{\"path\":\"$catalina_home\",\"version\":\"$version\",\"running\":true}")
+                    found_tomcats[$catalina_home]=1
+                    log_info "Found running Tomcat: $catalina_home (version: $version)"
+                fi
+            fi
+        done < <(pgrep -f "catalina|org.apache.catalina")
+    fi
 
     # Oracle Database Detection
     log_info "Detecting Oracle Database installations..."
@@ -896,6 +974,45 @@ phase9_application_detection() {
             done < <(find "$base_dir" -maxdepth 2 -type d -name "dbhome_*" 2>/dev/null)
         fi
     done
+
+    # Detect running Oracle processes
+    if pgrep -f "ora_pmon_" &>/dev/null; then
+        log_info "Detecting Oracle instances from running processes..."
+        while IFS= read -r pid; do
+            # Get the SID from the process name (ora_pmon_SIDNAME)
+            local pmon_sid=$(ps -p "$pid" -o comm= | sed 's/ora_pmon_//')
+            if [[ -n "$pmon_sid" ]]; then
+                # Try to get ORACLE_HOME from process environment
+                local proc_oracle_home=""
+                if [[ -r "/proc/$pid/environ" ]]; then
+                    proc_oracle_home=$(strings "/proc/$pid/environ" 2>/dev/null | grep "^ORACLE_HOME=" | cut -d= -f2 | head -1)
+                fi
+
+                # If we found an ORACLE_HOME and it's not already in our list, add it
+                if [[ -n "$proc_oracle_home" ]] && [[ -d "$proc_oracle_home" ]]; then
+                    # Check if this SID is already recorded
+                    set +u
+                    local already_found=false
+                    for existing in "${ORACLE_HOMES[@]}"; do
+                        if echo "$existing" | grep -q "\"sid\":\"$pmon_sid\""; then
+                            already_found=true
+                            break
+                        fi
+                    done
+                    set -u
+
+                    if [[ "$already_found" != "true" ]]; then
+                        local version="unknown"
+                        if [[ -f "$proc_oracle_home/bin/sqlplus" ]]; then
+                            version=$("$proc_oracle_home/bin/sqlplus" -version 2>/dev/null | grep "Release" | awk '{print $3}')
+                        fi
+                        ORACLE_HOMES+=("{\"oracle_home\":\"$proc_oracle_home\",\"sid\":\"$pmon_sid\",\"version\":\"$version\",\"running\":true}")
+                        log_info "Found running Oracle instance: $pmon_sid at $proc_oracle_home (version: $version)"
+                    fi
+                fi
+            fi
+        done < <(pgrep -f "ora_pmon_")
+    fi
 
     # Web Server Detection
     log_info "Detecting web servers..."
@@ -997,8 +1114,14 @@ phase10_process_analysis() {
             # Check if there's a systemd unit for it
             if ! systemctl list-units --all --no-pager | grep -q "$proc_name"; then
                 ((non_systemd_count++))
-                log_warn "Process '$proc_name' running but not managed by systemd"
-                NON_SYSTEMD_PROCESSES+=("\"$proc_name\"")
+                # Get the executable path for the first matching process
+                local pid=$(pgrep -f "$proc_name" | head -1)
+                local exe_path="unknown"
+                if [[ -n "$pid" ]] && [[ -L "/proc/$pid/exe" ]]; then
+                    exe_path=$(readlink -f "/proc/$pid/exe" 2>/dev/null || echo "unknown")
+                fi
+                log_warn "Process '$proc_name' running but not managed by systemd (executable: $exe_path)"
+                NON_SYSTEMD_PROCESSES+=("{\"name\":\"$proc_name\",\"executable\":\"$exe_path\"}")
             fi
         fi
     done
@@ -1551,7 +1674,10 @@ EOF
             set +u
             local proc="${NON_SYSTEMD_PROCESSES[$i]}"
             set -u
-            echo "- $proc" >> "$MD_FILE"
+            # Parse JSON to extract name and executable
+            local proc_name=$(echo "$proc" | sed 's/.*"name":"\([^"]*\)".*/\1/')
+            local proc_exe=$(echo "$proc" | sed 's/.*"executable":"\([^"]*\)".*/\1/')
+            echo "- **$proc_name**: \`$proc_exe\`" >> "$MD_FILE"
         done
         echo "" >> "$MD_FILE"
     else

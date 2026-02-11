@@ -394,36 +394,50 @@ The assessment is organized into logical phases. Each phase contains specific ch
 #### Phase 9: Application Detection
 
 - **Java JDK Detection**
-  - Check standard locations: `/usr/lib/jvm`, `/usr/java`, `/opt/java`
-  - Search /u0* directories for JDK installations
+  - Check standard locations: `/usr/lib/jvm`, `/usr/java`, `/opt/java`, `/usr/local`
+  - **Dynamically scan all `/u0*` directories** (e.g., `/u00`, `/u01`, `/u02`, etc.)
+  - Search for directories matching: `jdk*`, `java-*`, `jre*` patterns (maxdepth 5)
+  - **Detect JDK from running Java processes:**
+    - Find all `java` processes via `pgrep -f "java"`
+    - Read `/proc/$pid/exe` to get executable path
+    - Extract JAVA_HOME (two directories up from `bin/java`)
+    - Mark these installations as `in_use: true`
+  - **Duplicate prevention:** Track found installations to avoid listing twice
   - For each JDK found, capture version from `java -version`
-  - Check which services are using which JDK (via /proc/PID/cmdline)
-  - Determine if JDK is in use by running processes
-  - Store: `jdk_installations[]` with `path`, `version`, `in_use`, `used_by[]`
+  - Store: `jdk_installations[]` with `path`, `version`, `in_use`
 
 - **Tomcat Detection**
-  - Search for Tomcat in: `/opt/tomcat*`, `/usr/share/tomcat*`, `/u0*/tomcat*`
-  - Detect version from catalina.sh or version.sh
+  - **Dynamically scan all `/u0*` directories** plus standard locations:
+    - `/opt`, `/usr/share`, `/var/lib`, `/usr/local`
+  - Search for directories matching: `tomcat*` pattern (maxdepth 5)
+  - **Detect Tomcat from running processes:**
+    - Find processes matching `catalina` or `org.apache.catalina`
+    - Read `/proc/$pid/cmdline` to extract `-Dcatalina.home=` or `-Dcatalina.base=`
+    - Verify installation exists at extracted path
+    - Mark these as `running: true`
+  - **Duplicate prevention:** Track found installations to avoid listing twice
+  - Detect version from `catalina.sh` or `version.sh`
   - Check if running (systemd service or standalone process)
-  - Determine Tomcat version EOL status
-  - Capture connector ports from server.xml
-  - Store: `tomcat_installations[]` with `path`, `version`, `eol_date`, `running`, `ports[]`, `service_name`
+  - Store: `tomcat_installations[]` with `path`, `version`, `running`
 
 - **Oracle Database Detection**
   - Search for Oracle homes in `/u0*/app/oracle/product/*`, `/opt/oracle/*`
   - Check for oratab file at `/etc/oratab`
+  - **Detect running Oracle instances from processes:**
+    - Search for `ora_pmon_*` processes (Oracle process monitor)
+    - Extract SID from process name pattern `ora_pmon_<SIDNAME>`
+    - Read `/proc/$pid/environ` to get `ORACLE_HOME` environment variable
+    - Verify Oracle home exists and is not already detected
+    - Mark these as `running: true`
+  - **Duplicate prevention:** Check if SID already recorded before adding
   - For each Oracle home found:
-    - Determine Oracle version from `sqlplus -version` or `$ORACLE_HOME/inventory`
-    - List installed patches from `opatch lspatches` or `opatch lsinventory`
-    - Check for running instances via `ps -ef | grep pmon`
-    - Determine if managed by systemd (look for oracle*.service)
-    - Check listener status with `lsnrctl status`
+    - Determine Oracle version from `sqlplus -version` or inventory
+    - Check for running instances via `pgrep -f "ora_pmon_$sid"`
   - Store: `oracle_homes[]` with:
-    - `oracle_home_path`
-    - `oracle_version`
-    - `patches_applied[]`
-    - `instances[]` with `sid`, `status`, `process_manager`
-    - `listeners[]` with `name`, `status`, `port`
+    - `oracle_home`
+    - `sid`
+    - `version`
+    - `running` (boolean)
 
 - **Apache/Nginx Web Servers**
   - Check if httpd (Apache) or nginx is installed
@@ -484,9 +498,15 @@ The assessment is organized into logical phases. Each phase contains specific ch
 
 - **Systemd vs Non-Systemd Processes**
   - Cross-reference running processes with systemd units
-  - Identify processes NOT managed by systemd
+  - Identify processes NOT managed by systemd (check: `java`, `tomcat`, `oracle`, `httpd`, `nginx`)
+  - **Capture executable path for each non-systemd process:**
+    - Get PID of process via `pgrep -f "<process_name>"`
+    - Read `/proc/$pid/exe` via `readlink -f` to get full executable path
+    - Store both process name and executable location
   - Flag applications requiring manual startup
-  - Store: `non_systemd_processes[]` with `pid`, `command`, `parent_pid`
+  - Store: `non_systemd_processes[]` with:
+    - `name` (process name)
+    - `executable` (full path to executable)
 
 - **Process Resource Usage**
   - Top 10 processes by CPU usage
@@ -1264,7 +1284,7 @@ Use heredoc with variable expansion for JSON output:
 ```bash
 generate_json_output() {
     local timestamp_iso=$(date -Iseconds)
-    
+
     cat > "$JSON_FILE" << EOF
 {
   "assessment_metadata": {
@@ -1321,12 +1341,12 @@ EOF
     if [[ ${#JDK_INSTALLATIONS[@]} -gt 0 ]] 2>/dev/null; then
         jdk_count=${#JDK_INSTALLATIONS[@]}
     fi
-    
+
     if [[ $jdk_count -gt 0 ]]; then
         echo "" >> "$MD_FILE"
         echo "### Java Installations" >> "$MD_FILE"
         echo "" >> "$MD_FILE"
-        
+
         local num=1
         for jdk in "${JDK_INSTALLATIONS[@]}"; do
             local path=$(echo "$jdk" | grep -o '"path":"[^"]*"' | cut -d'"' -f4)
@@ -1346,19 +1366,19 @@ EOF
 ```bash
 generate_remediation_recommendations() {
     local rem_id=1
-    
+
     # Check condition and add recommendation
     if [[ ${OS_INFO[is_eol]} == "true" ]]; then
         REMEDIATION_ITEMS+=("$(printf '{"id":"REM-%03d","priority":"CRITICAL","category":"os","title":"OS is EOL","description":"OS %s is past end of life","impact":"No security updates","effort":"4-8 hours","risk":"Major upgrade required"}' $rem_id "${OS_INFO[name]}")")
         ((rem_id++))
     fi
-    
+
     # Check numeric thresholds
     if [[ ${SYSTEM_INFO[security_updates_available]:-0} -gt 0 ]]; then
         REMEDIATION_ITEMS+=("$(printf '{"id":"REM-%03d","priority":"HIGH","category":"security","title":"Security updates available","description":"%d updates pending","impact":"System vulnerable","effort":"30 minutes","risk":"May require reboot"}' $rem_id "${SYSTEM_INFO[security_updates_available]}")")
         ((rem_id++))
     fi
-    
+
     # Iterate over collected items
     for tomcat in "${TOMCAT_INSTALLATIONS[@]}"; do
         local version=$(echo "$tomcat" | grep -o '"version":"[^"]*"' | cut -d'"' -f4)
@@ -1383,12 +1403,12 @@ check_privileges() {
         USE_SUDO=""
         return 0
     fi
-    
+
     if sudo -n true 2>/dev/null; then
         USE_SUDO="sudo"
         return 0
     fi
-    
+
     log_error "Requires root or sudo privileges"
     exit 1
 }
@@ -1413,7 +1433,7 @@ Each check should be isolated and handle its own errors:
 ```bash
 phase_example() {
     log_info "=== Phase X: Example Phase ==="
-    
+
     # Check 1 - handle missing command
     if command -v some_command &>/dev/null; then
         local result=$(some_command 2>/dev/null || echo "unknown")
@@ -1422,7 +1442,7 @@ phase_example() {
         SYSTEM_INFO[some_value]="not available"
         log_warn "some_command not found"
     fi
-    
+
     # Check 2 - handle missing file
     if [[ -f /some/config/file ]]; then
         local value=$(grep "^Setting=" /some/config/file | cut -d= -f2)
@@ -1431,7 +1451,7 @@ phase_example() {
         SYSTEM_INFO[setting]="config not found"
         log_warn "Configuration file not found"
     fi
-    
+
     # Check 3 - handle command failure
     local output=$(complex_command 2>/dev/null)
     if [[ $? -eq 0 ]] && [[ -n "$output" ]]; then
@@ -1451,7 +1471,7 @@ Create symlinks to the latest assessment for easy access:
 ```bash
 create_symlinks() {
     cd "$LOGS_DIR" || return
-    
+
     ln -sf "$(basename "$LOG_FILE")" "latest-assessment.log"
     ln -sf "$(basename "$JSON_FILE")" "latest-assessment.json"
     ln -sf "$(basename "$MD_FILE")" "latest-assessment.md"
