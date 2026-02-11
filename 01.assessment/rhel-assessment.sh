@@ -1498,6 +1498,66 @@ EOF
 
 ---
 
+## System Management
+
+### Systemd Configuration
+- **Default Target:** ${SYSTEMD_INFO[default_target]:-unknown}
+- **Failed Services:** ${SYSTEMD_INFO[failed_services_count]:-0}
+
+EOF
+
+    # List failed services if any
+    local failed_svc_count=0
+    set +u
+    failed_svc_count=${#FAILED_SERVICES[@]}
+    set -u
+
+    if [[ $failed_svc_count -gt 0 ]]; then
+        echo "#### Failed Services:" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+        local i
+        for ((i=0; i<failed_svc_count; i++)); do
+            set +u
+            local svc="${FAILED_SERVICES[$i]}"
+            set -u
+            echo "- $svc" >> "$MD_FILE"
+        done
+        echo "" >> "$MD_FILE"
+    fi
+
+    cat >> "$MD_FILE" << EOF
+
+### Non-Systemd Managed Processes
+- **Count:** ${SYSTEM_INFO[non_systemd_processes_count]:-0}
+
+EOF
+
+    # List non-systemd processes if any
+    local non_systemd_count=0
+    set +u
+    non_systemd_count=${#NON_SYSTEMD_PROCESSES[@]}
+    set -u
+
+    if [[ $non_systemd_count -gt 0 ]]; then
+        echo "#### Processes Not Managed by Systemd:" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+        local i
+        for ((i=0; i<non_systemd_count; i++)); do
+            set +u
+            local proc="${NON_SYSTEMD_PROCESSES[$i]}"
+            set -u
+            echo "- $proc" >> "$MD_FILE"
+        done
+        echo "" >> "$MD_FILE"
+    else
+        echo "All detected processes are managed by systemd ✅" >> "$MD_FILE"
+        echo "" >> "$MD_FILE"
+    fi
+
+    cat >> "$MD_FILE" << EOF
+
+---
+
 ## Application Inventory
 
 ### Java Installations
