@@ -1,9 +1,15 @@
 #!/bin/bash
 
+SCRIPT_VERSION="1.0.1"
+
 ################################################################################
 # RHEL Server Assessment Script
-# Version: 1.0.0
+# Version: 1.0.1
 # Purpose: Assess RHEL/Rocky Linux servers and generate remediation plans
+#
+# Change Log:
+# - 1.0.1: Added list of non-systemd managed processes to markdown report
+# - 1.0.0: Initial script development and testing
 ################################################################################
 
 set -u  # Catch undefined variables
@@ -13,7 +19,6 @@ set -u  # Catch undefined variables
 # GLOBAL VARIABLES
 ################################################################################
 
-SCRIPT_VERSION="1.0.0"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORKSPACE_DIR="$(dirname "$SCRIPT_DIR")"
 LOGS_DIR="$WORKSPACE_DIR/logs"
